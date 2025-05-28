@@ -499,10 +499,14 @@ class DocumentBertScoringModel():
                     # QWK 기준으로만 판단 (단순화)
                     if overall_qwk > fold_best_qwk:
                         fold_best_qwk = overall_qwk
-                        fold_best_eval_loss = eval_loss
                         save_flag = True
                         improvement_msg = f"QWK 개선 ({overall_qwk:.4f})"
                         fold_patience_counter = 0
+                    elif eval_loss < fold_best_eval_loss:
+                        fold_best_eval_loss = eval_loss
+                        save_flag = True
+                        improvement_msg = f"Eval Loss 개선 ({eval_loss:.4f})"
+                        fold_patience_counter = 0                        
                     else:
                         fold_patience_counter += 1
                         improvement_msg = f"성능 개선 없음 (patience: {fold_patience_counter}/{patience})"
