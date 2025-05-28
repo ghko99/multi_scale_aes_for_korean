@@ -5,6 +5,67 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 
+def quadratic_weighted_kappa_single(rater_a, rater_b, min_rating=None, max_rating=None):
+    """단일 기준에 대한 QWK 계산"""
+    rater_a = np.array(rater_a, dtype=int)
+    rater_b = np.array(rater_b, dtype=int)
+    
+    if min_rating is None:
+        min_rating = min(min(rater_a), min(rater_b))
+    if max_rating is None:
+        max_rating = max(max(rater_a), max(rater_b))
+    
+    # 혼동 행렬 생성
+    num_ratings = max_rating - min_rating + 1
+    conf_mat = np.zeros((num_ratings, num_ratings))
+    
+    for a, b in zip(rater_a, rater_b):
+        conf_mat[a - min_rating][b - min_rating] += 1
+    
+    # 가중치 행렬 생성
+    weights = np.zeros((num_ratings, num_ratings))
+    for i in range(num_ratings):
+        for j in range(num_ratings):
+            weights[i, j] = ((i - j) ** 2) / ((num_ratings - 1) ** 2)
+    
+    # 기대 행렬 계산
+    hist_a = np.sum(conf_mat, axis=1)
+    hist_b = np.sum(conf_mat, axis=0)
+    expected = np.outer(hist_a, hist_b) / len(rater_a)
+    
+    # QWK 계산
+    numerator = np.sum(weights * conf_mat)
+    denominator = np.sum(weights * expected)
+    
+    if denominator == 0:
+        return 1.0
+    
+    return 1.0 - numerator / denominator
+
+
+
+# 기존 함수와의 호환성을 위한 래퍼 함수들
+def quadratic_weighted_kappa_multi(rater_a, rater_b):
+    """멀티 회귀를 위한 QWK (각 기준별로 계산 후 평균)"""
+    rater_a = np.array(rater_a)
+    rater_b = np.array(rater_b)
+    
+    if len(rater_a.shape) == 1:
+        return quadratic_weighted_kappa_single(rater_a, rater_b)
+    
+    qwk_scores = []
+    for i in range(rater_a.shape[1]):
+        # 0-3 범위를 정수로 변환 (QWK 계산을 위해)
+        a_rounded = np.round(rater_a[:, i] * 3).astype(int)  # 0-3 정수
+        b_rounded = np.round(rater_b[:, i] * 3).astype(int)  # 0-3 정수
+        
+        qwk = quadratic_weighted_kappa_single(a_rounded, b_rounded, min_rating=0, max_rating=3)
+        qwk_scores.append(qwk)
+    
+    return np.mean(qwk_scores)
+
+
+
 def evaluation_multi_regression(true_labels, pred_labels, criterion_names=None):
     """
     11개 평가 기준에 대한 멀티-태스크 회귀 평가 함수
@@ -39,13 +100,15 @@ def evaluation_multi_regression(true_labels, pred_labels, criterion_names=None):
     overall_rmse = np.sqrt(overall_mse)
     overall_r2 = r2_score(true_labels.flatten(), pred_labels.flatten())
     overall_pearson = pearsonr(true_labels.flatten(), pred_labels.flatten())[0]
-    
+    overall_qwk = quadratic_weighted_kappa_multi(np.round(true_labels).astype(int).flatten() , np.round(pred_labels).astype(int).flatten())
+
     results['overall'] = {
         'MSE': overall_mse,
         'MAE': overall_mae,
         'RMSE': overall_rmse,
         'R2': overall_r2,
-        'Pearson': overall_pearson
+        'Pearson': overall_pearson,
+        "QWK" : overall_qwk
     }
     
     # 평가 기준별 성능 평가
@@ -59,7 +122,9 @@ def evaluation_multi_regression(true_labels, pred_labels, criterion_names=None):
         rmse = np.sqrt(mse)
         r2 = r2_score(true_criterion, pred_criterion)
         pearson = pearsonr(true_criterion, pred_criterion)[0]
-        
+        qwk = quadratic_weighted_kappa_multi(np.round(true_criterion).astype(int), np.round(pred_criterion).astype(int))
+
+
         # 정확도 (허용 오차 내)
         tolerance_01_acc = np.mean(np.abs(pred_criterion - true_criterion) <= 0.1)
         tolerance_02_acc = np.mean(np.abs(pred_criterion - true_criterion) <= 0.2)
@@ -71,6 +136,7 @@ def evaluation_multi_regression(true_labels, pred_labels, criterion_names=None):
             'RMSE': rmse,
             'R2': r2,
             'Pearson': pearson,
+            "QWK" : qwk,
             'Tolerance_0.1_Acc': tolerance_01_acc,
             'Tolerance_0.2_Acc': tolerance_02_acc,
             'Tolerance_0.5_Acc': tolerance_05_acc
@@ -116,17 +182,18 @@ def print_evaluation_results(results, detailed=True):
     print(f"  RMSE: {overall['RMSE']:.4f}")
     print(f"  R²: {overall['R2']:.4f}")
     print(f"  Pearson 상관계수: {overall['Pearson']:.4f}")
+    print(f"  Quadratic Weighted Kappa Score: {overall['QWK']:.4f}")
     
     # 평가 기준별 성능
     print("\n📊 평가 기준별 성능:")
     print("-" * 100)
-    print(f"{'평가기준':<12} {'MSE':<8} {'MAE':<8} {'RMSE':<8} {'R²':<8} {'Pearson':<8} {'±0.1정확도':<10} {'±0.2정확도':<10} {'±0.5정확도':<10}")
+    print(f"{'평가기준':<12} {'MSE':<8} {'MAE':<8} {'RMSE':<8} {'R²':<8} {'Pearson':<8} {'QWK':<8} {'±0.1정확도':<10} {'±0.2정확도':<10} {'±0.5정확도':<10}")
     print("-" * 100)
     
     for criterion, metrics in results['by_criterion'].items():
         print(f"{criterion:<12} {metrics['MSE']:<8.4f} {metrics['MAE']:<8.4f} {metrics['RMSE']:<8.4f} "
-              f"{metrics['R2']:<8.4f} {metrics['Pearson']:<8.4f} {metrics['Tolerance_0.1_Acc']:<10.4f} "
-              f"{metrics['Tolerance_0.2_Acc']:<10.4f} {metrics['Tolerance_0.5_Acc']:<10.4f}")
+              f"{metrics['R2']:<8.4f} {metrics['Pearson']:<8.4f} {metrics['QWK']:<8.4f} "
+              f"{metrics['Tolerance_0.1_Acc']:<10.4f} {metrics['Tolerance_0.2_Acc']:<10.4f} {metrics['Tolerance_0.5_Acc']:<10.4f}")
     
     if detailed:
         # 점수 분포 분석
@@ -162,6 +229,17 @@ def plot_evaluation_results(results, save_path=None):
     axes[0, 1].set_title('평가 기준별 Pearson 상관계수')
     axes[0, 1].set_xlabel('평가 기준')
     axes[0, 1].set_ylabel('Pearson 상관계수')
+    axes[0, 1].set_xticks(range(len(criteria)))
+    axes[0, 1].set_xticklabels(criteria, rotation=45, ha='right')
+    axes[0, 1].set_ylim(0, 1)
+
+    # 2. 평가 기준별 QWK
+    pearson_values = [results['by_criterion'][c]['QWK'] for c in criteria]
+    
+    axes[0, 1].bar(range(len(criteria)), pearson_values, color='lightcoral')
+    axes[0, 1].set_title('평가 기준별 QWK')
+    axes[0, 1].set_xlabel('평가 기준')
+    axes[0, 1].set_ylabel('QWK')
     axes[0, 1].set_xticks(range(len(criteria)))
     axes[0, 1].set_xticklabels(criteria, rotation=45, ha='right')
     axes[0, 1].set_ylim(0, 1)
@@ -231,94 +309,5 @@ def analyze_prediction_errors(true_labels, pred_labels, criterion_names=None, to
         print(f"  {i+1}. {criterion}: 평균 오차 {mean_error:.3f}")
 
 
-# 기존 함수와의 호환성을 위한 래퍼 함수들
-def quadratic_weighted_kappa_multi(rater_a, rater_b):
-    """멀티 회귀를 위한 QWK (각 기준별로 계산 후 평균)"""
-    rater_a = np.array(rater_a)
-    rater_b = np.array(rater_b)
-    
-    if len(rater_a.shape) == 1:
-        return quadratic_weighted_kappa_single(rater_a, rater_b)
-    
-    qwk_scores = []
-    for i in range(rater_a.shape[1]):
-        # 0-3 범위를 정수로 변환 (QWK 계산을 위해)
-        a_rounded = np.round(rater_a[:, i] * 3).astype(int)  # 0-3 정수
-        b_rounded = np.round(rater_b[:, i] * 3).astype(int)  # 0-3 정수
-        
-        qwk = quadratic_weighted_kappa_single(a_rounded, b_rounded, min_rating=0, max_rating=3)
-        qwk_scores.append(qwk)
-    
-    return np.mean(qwk_scores)
 
 
-def quadratic_weighted_kappa_single(rater_a, rater_b, min_rating=None, max_rating=None):
-    """단일 기준에 대한 QWK 계산"""
-    rater_a = np.array(rater_a, dtype=int)
-    rater_b = np.array(rater_b, dtype=int)
-    
-    if min_rating is None:
-        min_rating = min(min(rater_a), min(rater_b))
-    if max_rating is None:
-        max_rating = max(max(rater_a), max(rater_b))
-    
-    # 혼동 행렬 생성
-    num_ratings = max_rating - min_rating + 1
-    conf_mat = np.zeros((num_ratings, num_ratings))
-    
-    for a, b in zip(rater_a, rater_b):
-        conf_mat[a - min_rating][b - min_rating] += 1
-    
-    # 가중치 행렬 생성
-    weights = np.zeros((num_ratings, num_ratings))
-    for i in range(num_ratings):
-        for j in range(num_ratings):
-            weights[i, j] = ((i - j) ** 2) / ((num_ratings - 1) ** 2)
-    
-    # 기대 행렬 계산
-    hist_a = np.sum(conf_mat, axis=1)
-    hist_b = np.sum(conf_mat, axis=0)
-    expected = np.outer(hist_a, hist_b) / len(rater_a)
-    
-    # QWK 계산
-    numerator = np.sum(weights * conf_mat)
-    denominator = np.sum(weights * expected)
-    
-    if denominator == 0:
-        return 1.0
-    
-    return 1.0 - numerator / denominator
-
-
-# 기존 evaluation 함수와의 호환성
-def evaluation(true_label, pre_label, multi_regression=True):
-    """
-    통합 평가 함수 (하위 호환성 지원)
-    """
-    if multi_regression:
-        results = evaluation_multi_regression(true_label, pre_label)
-        # 기존 형식과 맞추기 위해 주요 지표들을 리스트로 반환
-        return [
-            results['overall']['MSE'],          # 0: MSE
-            results['overall']['MAE'],          # 1: MAE  
-            results['overall']['RMSE'],         # 2: RMSE
-            results['overall']['R2'],           # 3: R2
-            results['overall']['Pearson'],      # 4: Pearson
-            0, 0,  # 5, 6: 기존 호환성을 위한 더미 값
-            results['overall']['Pearson'],      # 7: Pearson (기존 pearson 자리)
-            quadratic_weighted_kappa_multi(true_label, pre_label)  # 8: QWK
-        ]
-    else:
-        # 기존 단일 회귀 평가
-        return evaluation_single_regression(true_label, pre_label)
-
-
-def evaluation_single_regression(true_score, pre_score):
-    """단일 회귀를 위한 기존 평가 함수"""
-    mse = mean_squared_error(true_score, pre_score)
-    mae = mean_absolute_error(true_score, pre_score)
-    rmse = np.sqrt(mse)
-    r2 = r2_score(true_score, pre_score)
-    pearson = pearsonr(true_score, pre_score)[0]
-    
-    return [mse, mae, rmse, r2, pearson, 0, 0, pearson, 0]

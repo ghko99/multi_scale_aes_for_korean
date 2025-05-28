@@ -2,6 +2,7 @@ import torch
 from torch import nn
 from torch.nn import LSTM
 from transformers import BertPreTrainedModel, BertConfig, BertModel
+from kobert_transformers import get_kobert_model, get_tokenizer
 import torch.nn.functional as F
 
 def init_weights(m):
@@ -13,7 +14,7 @@ def init_weights(m):
 class DocumentBertSentenceChunkAttentionLSTM(BertPreTrainedModel):  
     def __init__(self, bert_model_config: BertConfig):
         super(DocumentBertSentenceChunkAttentionLSTM, self).__init__(bert_model_config)
-        self.bert = BertModel(bert_model_config)  
+        self.bert = get_kobert_model()
         self.dropout = nn.Dropout(p=bert_model_config.hidden_dropout_prob)
         self.lstm = LSTM(bert_model_config.hidden_size, bert_model_config.hidden_size, batch_first=True)
         
@@ -85,7 +86,7 @@ class DocumentBertCombineWordDocumentLinear(BertPreTrainedModel):
     def __init__(self, bert_model_config: BertConfig):
         super(DocumentBertCombineWordDocumentLinear, self).__init__(bert_model_config)
         
-        self.bert = BertModel(bert_model_config)
+        self.bert = get_kobert_model()
         self.dropout = nn.Dropout(p=bert_model_config.hidden_dropout_prob)
 
         # 11개의 평가 기준을 위한 멀티-태스크 회귀
