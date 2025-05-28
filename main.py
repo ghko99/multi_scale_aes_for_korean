@@ -134,45 +134,10 @@ def create_directories():
 
 def get_optimal_settings(device):
     """GPU 메모리에 따른 최적 설정"""
-    if device == 'cpu':
-        return {
-            'batch_size': 4,
-            'gradient_accumulation_steps': 1,
-            'max_grad_norm': 1.0
-        }
-    
-    total_memory = torch.cuda.get_device_properties(0).total_memory
-    gpu_gb = total_memory // 1024**3
-    
-    if gpu_gb >= 24:  # 24GB+
-        return {
-            'batch_size': 16,
+    return {
+            'batch_size': 8,
             'gradient_accumulation_steps': 4,
             'max_grad_norm': 1.0
-        }
-    elif gpu_gb >= 16:  # 16GB+
-        return {
-            'batch_size': 12,
-            'gradient_accumulation_steps': 3,
-            'max_grad_norm': 1.0
-        }
-    elif gpu_gb >= 12:  # 12GB+
-        return {
-            'batch_size': 10,
-            'gradient_accumulation_steps': 2,
-            'max_grad_norm': 1.0
-        }
-    elif gpu_gb >= 8:   # 8GB+
-        return {
-            'batch_size': 8,
-            'gradient_accumulation_steps': 2,
-            'max_grad_norm': 1.0
-        }
-    else:  # 8GB 미만
-        return {
-            'batch_size': 6,
-            'gradient_accumulation_steps': 1,
-            'max_grad_norm': 0.5
         }
 
 def main():
