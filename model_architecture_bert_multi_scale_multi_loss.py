@@ -2,15 +2,14 @@ import os
 import torch
 from transformers import BertConfig, CONFIG_NAME, AutoTokenizer
 from document_bert_architectures import DocumentBertCombineWordDocumentLinear, DocumentBertSentenceChunkAttentionLSTM
-from evaluate import evaluation_multi_regression
+from evaluate import quadratic_weighted_kappa_multi
 from encoder import encode_documents_by_sentence, encode_documents_full_text
 from torch.nn import functional as F
-import matplotlib.pyplot as plt
-from tqdm import tqdm
 import numpy as np
-import pandas as pd
 from sklearn.model_selection import KFold
 from sklearn.metrics import mean_squared_error, mean_absolute_error
+from datetime import datetime
+import time
 
 # 코사인 유사도 기반 손실
 def sim_loss(y, yhat):
@@ -50,7 +49,7 @@ class DocumentBertScoringModel():
             # 기본 설정
             self.args = {
                 'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-                'batch_size': 8,
+                'batch_size': 4,
                 'model_directory': './models',
                 'result_file': 'result.txt'
             }
@@ -156,7 +155,7 @@ class DocumentBertScoringModel():
                 mr_loss_val = mr_loss_func(batch_predictions_combined, batch_labels)
                 
                 # 가중 손실
-                a, b, c = 1, 0.5, 1  # 가중치
+                a, b, c = 1, 1, 2  # 가중치
                 total_loss = a * mse_loss + b * sim_loss_val + c * mr_loss_val
                 eval_loss += total_loss.item()
                 count += 1
@@ -182,34 +181,57 @@ class DocumentBertScoringModel():
         # 전체 MSE, MAE
         overall_mse = mean_squared_error(true_labels_np.flatten(), predictions_np.flatten())
         overall_mae = mean_absolute_error(true_labels_np.flatten(), predictions_np.flatten())
-        
+        overall_qwk = quadratic_weighted_kappa_multi(np.round(true_labels_np).astype(int).flatten() , np.round(predictions_np).astype(int).flatten())
+
+
         # 각 평가 기준별 MSE, MAE
         criterion_mse = []
         criterion_mae = []
+        criterion_qwk = []
         for i in range(11):
             mse = mean_squared_error(true_labels_np[:, i], predictions_np[:, i])
             mae = mean_absolute_error(true_labels_np[:, i], predictions_np[:, i])
+            qwk = quadratic_weighted_kappa_multi(np.round(true_labels_np[:,i]).astype(int), np.round(predictions_np[:,i]).astype(int))
             criterion_mse.append(mse)
             criterion_mae.append(mae)
+            criterion_qwk.append(qwk)
         
-        print(f"Overall MSE: {overall_mse:.4f}")
-        print(f"Overall MAE: {overall_mae:.4f}")
+        print(f"Overall MSE: {overall_mse:.4f} Overall MAE: {overall_mae:.4f} Overall QWK: {overall_qwk:.4f}")
         
         for i, criterion in enumerate(self.criterion_names):
-            print(f"{criterion} - MSE: {criterion_mse[i]:.4f}, MAE: {criterion_mae[i]:.4f}")
+            print(f"{criterion} - MSE: {criterion_mse[i]:.4f}, MAE: {criterion_mae[i]:.4f}, QWK: {criterion_qwk[i]:.4f}")
         
-        return overall_mse, overall_mae, (true_labels_np, predictions_np), eval_loss, criterion_mse, criterion_mae
+        return overall_mse, overall_mae, (true_labels_np, predictions_np), overall_qwk, eval_loss, criterion_mse, criterion_mae, criterion_qwk
 
-    def fit(self, data_, test=None, mode='train'):
-        """11개 평가 기준에 대한 멀티-태스크 회귀 학습"""
-        lr = 2e-5
-        epochs = 20
-        weight_decay = 0.01
+    def fit(self, data_, test=None, mode='train', patience=5, log_dir='./logs'):
+        """11개 평가 기준에 대한 멀티-태스크 회귀 학습 (로깅 및 early stopping 추가)"""
+        lr = 6e-5
+        epochs = 16
+        weight_decay = 0.005
+        
+        # 로그 디렉토리 생성
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, f'training_log_{mode}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.txt')
+        
+        # 로그 파일 초기화
+        with open(log_file, 'w', encoding='utf-8') as f:
+            f.write(f"Training Log - {mode} mode\n")
+            f.write(f"Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Learning Rate: {lr}\n")
+            f.write(f"Max Epochs: {epochs}\n")
+            f.write(f"Weight Decay: {weight_decay}\n")
+            f.write(f"Patience: {patience}\n")
+            f.write(f"Batch Size: {self.args['batch_size']}\n")
+            f.write("="*80 + "\n\n")
+        
+        model_save_dir = './models'
+        doc_model_save_dir = '{}/doc_model'.format(model_save_dir)
+        chunk_model_save_dir = "{}/chunk_model".format(model_save_dir)
         
         # 옵티마이저
-        word_document_optimizer = torch.optim.AdamW(
+        word_document_optimizer = torch.optim.Adam(
             self.bert_regression_by_word_document.parameters(), lr=lr, weight_decay=weight_decay)
-        chunk_optimizer = torch.optim.AdamW(
+        chunk_optimizer = torch.optim.Adam(
             self.bert_regression_by_chunk.parameters(), lr=lr, weight_decay=weight_decay)
         
         # 학습률 스케줄러
@@ -224,8 +246,15 @@ class DocumentBertScoringModel():
         mse_list = []
         mae_list = []
         
+        def log_message(message):
+            """로그 메시지를 파일과 콘솔에 동시 출력"""
+            print(message)
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
+        
         for fold, (train_index, test_index) in enumerate(kf.split(data_[0])):
-            print(f"Fold {fold + 1}/5")
+            log_message(f"=== Fold {fold + 1}/5 시작 ===")
+            fold_start_time = time.time()
             
             train_essays = data_[0].iloc[train_index]
             train_labels = data_[1].iloc[train_index]
@@ -236,13 +265,21 @@ class DocumentBertScoringModel():
             data = train_essays.tolist(), train_labels.values
             test_data = test_essays.tolist(), test_labels.values
             
+            log_message(f"훈련 데이터: {len(train_essays)}개, 검증 데이터: {len(test_essays)}개")
+            
             # 데이터 인코딩
+            log_message("데이터 인코딩 시작...")
+            encoding_start_time = time.time()
+            
             document_representations_sentence, _ = encode_documents_by_sentence(
                 data[0], self.bert_tokenizer, max_input_length=self.max_sentence_length)
             document_representations_full, _ = encode_documents_full_text(
                 data[0], self.bert_tokenizer, max_input_length=self.max_doc_length)
             
             correct_output = torch.FloatTensor(data[1])
+            
+            encoding_time = time.time() - encoding_start_time
+            log_message(f"데이터 인코딩 완료 (소요시간: {encoding_time:.2f}초)")
             
             # 모델을 디바이스로 이동
             self.bert_regression_by_word_document.to(device=self.args['device'])
@@ -251,12 +288,27 @@ class DocumentBertScoringModel():
             self.bert_regression_by_word_document.train()
             self.bert_regression_by_chunk.train()
             
+            # Fold별 early stopping 초기화
+            fold_best_qwk = -np.inf
+            fold_best_eval_loss = np.inf
+            fold_patience_counter = 0
+            fold_early_stop = False
+            
             # 학습 루프
             for epoch in range(1, epochs + 1):
+                if fold_early_stop:
+                    log_message(f"Early stopping triggered at epoch {epoch-1}")
+                    break
+                    
+                epoch_start_time = time.time()
                 epoch_loss = 0
                 num_batches = 0
                 
+                log_message(f"--- Epoch {epoch}/{epochs} 시작 ---")
+                
                 for i in range(0, document_representations_sentence.shape[0], self.args['batch_size']):
+                    batch_start_time = time.time()
+                    
                     # 배치 데이터 준비
                     batch_sentence = document_representations_sentence[i:i + self.args['batch_size']].to(
                         device=self.args['device'])
@@ -278,7 +330,7 @@ class DocumentBertScoringModel():
                     mr_loss_val = mr_loss_func(combined_predictions, batch_labels)
                     
                     # 가중 손실
-                    a, b, c = 1, 0.5, 1
+                    a, b, c = 1, 1, 2
                     total_loss = a * mse_loss + b * sim_loss_val + c * mr_loss_val
                     
                     # Backward pass
@@ -297,34 +349,112 @@ class DocumentBertScoringModel():
                     
                     epoch_loss += total_loss.item()
                     num_batches += 1
+                    
+                    batch_time = time.time() - batch_start_time
+                    
+                    # 배치별 상세 로깅 (매 10 배치마다)
+                    if num_batches % 10 == 0:
+                        log_message(f"  Batch {num_batches}: Loss={total_loss.item():.4f} "
+                                f"(MSE={mse_loss.item():.4f}, Sim={sim_loss_val.item():.4f}, "
+                                f"MR={mr_loss_val.item():.4f}) Time={batch_time:.2f}s")
                 
                 epoch_loss /= num_batches
                 loss_list.append(epoch_loss)
+                epoch_time = time.time() - epoch_start_time
                 
                 # 학습률 업데이트
                 word_document_scheduler.step()
                 chunk_scheduler.step()
                 
-                print(f'Fold {fold + 1}, Epoch {epoch}, Loss: {epoch_loss:.4f}')
+                current_lr_word = word_document_scheduler.get_last_lr()[0]
+                current_lr_chunk = chunk_scheduler.get_last_lr()[0]
+                
+                log_message(f'Fold {fold + 1}, Epoch {epoch} 완료 - '
+                        f'Loss: {epoch_loss:.4f}, '
+                        f'LR_word: {current_lr_word:.2e}, '
+                        f'LR_chunk: {current_lr_chunk:.2e}, '
+                        f'Time: {epoch_time:.2f}s')
                 
                 # 검증
-                if epoch % 4 == 0 and test_data:
-                    overall_mse, overall_mae, _, eval_loss, criterion_mse, criterion_mae = self.predict_for_regress(test_data)
+                if test:
+                    eval_start_time = time.time()
+                    log_message("검증 시작...")
+                    
+                    overall_mse, overall_mae, _, overall_qwk, eval_loss, criterion_mse, criterion_mae, criterion_qwk = self.predict_for_regress(test_data)
                     mse_list.append(overall_mse)
                     mae_list.append(overall_mae)
+                    
+                    eval_time = time.time() - eval_start_time
+                    
+                    # 평가 기준별 상세 로깅
+                    log_message(f"검증 완료 (소요시간: {eval_time:.2f}초)")
+                    log_message(f"Overall - MSE: {overall_mse:.4f}, MAE: {overall_mae:.4f}, "
+                            f"QWK: {overall_qwk:.4f}, Eval Loss: {eval_loss:.4f}")
+                    
+                    # 각 평가 기준별 결과 로깅
+                    for i, criterion in enumerate(self.criterion_names):
+                        log_message(f"  {criterion}: MSE={criterion_mse[i]:.4f}, "
+                                f"MAE={criterion_mae[i]:.4f}, QWK={criterion_qwk[i]:.4f}")
+                    
+                    new_qwk = np.mean([overall_qwk] + criterion_qwk)
+                    save_flag = False
+                    improvement_msg = ""
+                    
+                    # 모델 저장 조건 체크
+                    if eval_loss < fold_best_eval_loss:
+                        fold_best_eval_loss = eval_loss
+                        save_flag = True
+                        improvement_msg += f"Eval Loss 개선 ({eval_loss:.4f}) "
+                        fold_patience_counter = 0
+                    elif new_qwk > fold_best_qwk:
+                        fold_best_qwk = new_qwk
+                        save_flag = True
+                        improvement_msg += f"QWK 개선 ({new_qwk:.4f}) "
+                        fold_patience_counter = 0
+                    else:
+                        fold_patience_counter += 1
+                        improvement_msg = f"성능 개선 없음 (patience: {fold_patience_counter}/{patience})"
+                    
+                    if save_flag:
+                        if not os.path.exists(model_save_dir):
+                            os.makedirs(model_save_dir)
+                        self.bert_regression_by_word_document.save_pretrained(doc_model_save_dir)
+                        self.bert_regression_by_chunk.save_pretrained(chunk_model_save_dir)
+                        log_message(f"모델 저장 완료: {improvement_msg}")
+                    else:
+                        log_message(improvement_msg)
+                    
+                    # Early stopping 체크
+                    if fold_patience_counter >= patience:
+                        log_message(f"Early stopping: {patience} epochs 동안 성능 개선 없음")
+                        fold_early_stop = True
                     
                     # 다시 학습 모드로 변경
                     self.bert_regression_by_word_document.train()
                     self.bert_regression_by_chunk.train()
+            
+            fold_time = time.time() - fold_start_time
+            log_message(f"=== Fold {fold + 1} 완료 (총 소요시간: {fold_time:.2f}초) ===\n")
         
-        # 결과 저장
+        # 전체 학습 완료 후 결과 저장
         os.makedirs('./train_valid_loss', exist_ok=True)
         np.save(f'./train_valid_loss/{mode}_loss.npy', np.array(loss_list))
         np.save(f'./train_valid_loss/{mode}_mse.npy', np.array(mse_list))
         np.save(f'./train_valid_loss/{mode}_mae.npy', np.array(mae_list))
         
-        print(f"Average MSE: {np.mean(mse_list):.4f}")
-        print(f"Average MAE: {np.mean(mae_list):.4f}")
+        final_mse = np.mean(mse_list)
+        final_mae = np.mean(mae_list)
+        
+        log_message("="*80)
+        log_message("학습 완료!")
+        log_message(f"최종 평균 MSE: {final_mse:.4f}")
+        log_message(f"최종 평균 MAE: {final_mae:.4f}")
+        log_message(f"로그 파일 저장 위치: {log_file}")
+        log_message(f"종료 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        print(f"Average MSE: {final_mse:.4f}")
+        print(f"Average MAE: {final_mae:.4f}")
+        print(f"Training log saved to: {log_file}")
 
     def predict_single(self, input_sentence):
         """단일 문장에 대한 11개 평가 기준 예측"""
