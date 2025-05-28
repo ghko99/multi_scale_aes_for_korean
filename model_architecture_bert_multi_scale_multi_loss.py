@@ -43,18 +43,20 @@ def focal_mse_loss(pred, target, alpha=0.25, gamma=2.0):
     return torch.mean(focal_weight * mse)
 
 def improved_mr_loss_func(pred, label, margin=0.1):
-    """개선된 순위 손실 (마진 추가)"""
-    if label.size(0) <= 1:
-        return torch.tensor(0.0, device=pred.device)
+    """개선된 순위 손실 (마진 추가) - 타입 안전성 보장"""
+    device = pred.device
     
-    total_mr_loss = 0
+    if label.size(0) <= 1:
+        return torch.tensor(0.0, device=device, dtype=pred.dtype)
+    
+    total_mr_loss = torch.tensor(0.0, device=device, dtype=pred.dtype)
     num_criteria = pred.size(1)
     
     for criterion in range(num_criteria):
         pred_criterion = pred[:, criterion]
         label_criterion = label[:, criterion]
         
-        mr_loss = 0
+        mr_loss = torch.tensor(0.0, device=device, dtype=pred.dtype)
         pairs = 0
         
         for i in range(label.size(0)):
@@ -63,15 +65,56 @@ def improved_mr_loss_func(pred, label, margin=0.1):
                 true_diff = label_criterion[i] - label_criterion[j]
                 pred_diff = pred_criterion[i] - pred_criterion[j]
                 
-                # 순위가 뒤바뀐 경우에만 패널티
-                if true_diff * pred_diff < 0:  # 부호가 다름
-                    mr_loss += torch.clamp(margin - pred_diff * torch.sign(true_diff), min=0)
-                    pairs += 1
+                # 순위가 뒤바뀌었고 차이가 유의미한 경우에만 패널티
+                if torch.abs(true_diff) > 0.1:  # 최소 차이 임계값
+                    if true_diff * pred_diff < 0:  # 부호가 다름
+                        penalty = torch.clamp(margin - pred_diff * torch.sign(true_diff), min=0)
+                        mr_loss += penalty
+                        pairs += 1
         
         if pairs > 0:
             total_mr_loss += mr_loss / pairs
     
-    return total_mr_loss / num_criteria if num_criteria > 0 else torch.tensor(0.0, device=pred.device)
+    # 평균 계산 - 항상 텐서 반환 보장
+    if num_criteria > 0:
+        result = total_mr_loss / num_criteria
+    else:
+        result = torch.tensor(0.0, device=device, dtype=pred.dtype)
+    
+    return result
+
+# 균형 잡힌 손실 함수 (불균형 데이터 대응)
+def balanced_multi_criterion_loss(pred, target, criterion_weights=None):
+    """평가 기준별 균형을 고려한 손실 함수"""
+    device = pred.device
+    
+    if criterion_weights is None:
+        # 기본 가중치 (어려운 기준에 더 높은 가중치)
+        # 인덱스: 문법정확도, 단어선택, 문장표현, 문단내구조, 문단간구조, 구조일관성, 분량적절성, 주제명료성, 창의성, 프롬프트독해력, 설명구체성
+        weights = torch.tensor([
+            0.8,  # 문법 정확도 (쉬움)
+            0.8,  # 단어 선택의 적절성 (쉬움)
+            1.5,  # 문장 표현 (어려움)
+            0.9,  # 문단 내 구조 (보통)
+            1.5,  # 문단 간 구조 (어려움)
+            1.2,  # 구조의 일관성 (보통-어려움)
+            0.8,  # 분량의 적절성 (쉬움)
+            0.8,  # 주제 명료성 (쉬움)
+            1.1,  # 창의성 (보통)
+            1.5,  # 프롬프트 독해력 (어려움)
+            0.9   # 설명의 구체성 (보통)
+        ], device=device, dtype=pred.dtype)
+    else:
+        weights = torch.tensor(criterion_weights, device=device, dtype=pred.dtype)
+    
+    # 기준별 MSE 계산
+    criterion_losses = []
+    for i in range(pred.size(1)):
+        criterion_mse = F.mse_loss(pred[:, i], target[:, i])
+        weighted_mse = criterion_mse * weights[i]
+        criterion_losses.append(weighted_mse)
+    
+    return torch.stack(criterion_losses).mean()
 
 class DocumentBertScoringModel():
     def __init__(self, load_model=False, chunk_model_path=None, word_doc_model_path=None, config=None, args=None):
@@ -184,25 +227,19 @@ class DocumentBertScoringModel():
                 batch_predictions_combined = 0.6 * batch_predictions_sentence + 0.4 * batch_predictions_full
                 predictions[i:i + self.args['batch_size']] = batch_predictions_combined.cpu()
                 
-                # 손실 계산
+                # 손실 계산 (간소화된 버전)
                 batch_labels = correct_output[i:i + self.args['batch_size']].to(device=self.args['device'])
                 
-                # 개선된 손실 함수들 사용
-                focal_mse = focal_mse_loss(batch_predictions_combined, batch_labels)
-                sim_loss_val = improved_sim_loss(batch_predictions_combined, batch_labels)
-                mr_loss_val = improved_mr_loss_func(batch_predictions_combined, batch_labels)
-                
-                losses = torch.stack([focal_mse, sim_loss_val, mr_loss_val])
-                total_loss, weights = self.adaptive_loss(losses)
-                
-                eval_loss += total_loss.item()
+                # 균형 잡힌 손실 사용
+                balanced_loss = balanced_multi_criterion_loss(batch_predictions_combined, batch_labels)
+                eval_loss += balanced_loss.item()
                 count += 1
                 
             eval_loss /= count
 
         # 결과 저장
         if writeflag:
-            outfile = open(os.path.join(self.args['model_directory'], self.args['result_file']), "w")
+            outfile = open(os.path.join(self.args['model_directory'], self.args['result_file']), "w", encoding='utf-8')
             for i in range(predictions.shape[0]):
                 true_scores = correct_output[i].numpy()
                 pred_scores = predictions[i].numpy()
@@ -242,10 +279,10 @@ class DocumentBertScoringModel():
         return overall_mse, overall_mae, (true_labels_np, predictions_np), overall_qwk, eval_loss, criterion_mse, criterion_mae, criterion_qwk
 
     def fit(self, data_, test=None, mode='train', patience=8, log_dir='./logs'):
-        """개선된 멀티-태스크 회귀 학습"""
+        """개선된 멀티-태스크 회귀 학습 (버그 수정 및 불균형 데이터 대응)"""
         # 개선된 하이퍼파라미터
-        lr = 2e-4  # 학습률 증가
-        epochs = 20  # 에포크 수 증가
+        lr = 3e-4  # 학습률 더 증가
+        epochs = 16  # 에포크 수 조정
         weight_decay = 0.01
         warmup_steps_ratio = self.args['warmup_ratio']
         
@@ -254,7 +291,7 @@ class DocumentBertScoringModel():
         log_file = os.path.join(log_dir, f'training_log_{mode}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.txt')
         
         with open(log_file, 'w', encoding='utf-8') as f:
-            f.write(f"개선된 Training Log - {mode} mode\n")
+            f.write(f"수정된 Training Log - {mode} mode\n")
             f.write(f"Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"Learning Rate: {lr}\n")
             f.write(f"Max Epochs: {epochs}\n")
@@ -269,45 +306,13 @@ class DocumentBertScoringModel():
         chunk_model_save_dir = "{}/chunk_model".format(model_save_dir)
         
         # 개선된 옵티마이저 설정
-        # 다른 학습률로 레이어별 설정
-        no_decay = ["bias", "LayerNorm.weight"]
+        optimizer = torch.optim.AdamW([
+            {'params': self.bert_regression_by_word_document.parameters(), 'lr': lr * 0.1},  # BERT는 낮은 학습률
+            {'params': self.bert_regression_by_chunk.parameters(), 'lr': lr * 0.1},
+            {'params': self.adaptive_loss.parameters(), 'lr': lr * 2}  # 손실 가중치는 높은 학습률
+        ], weight_decay=weight_decay)
         
-        optimizer_grouped_parameters = [
-            {
-                "params": [p for n, p in self.bert_regression_by_word_document.named_parameters() 
-                          if not any(nd in n for nd in no_decay)],
-                "weight_decay": weight_decay,
-                "lr": lr
-            },
-            {
-                "params": [p for n, p in self.bert_regression_by_word_document.named_parameters() 
-                          if any(nd in n for nd in no_decay)],
-                "weight_decay": 0.0,
-                "lr": lr
-            },
-            {
-                "params": [p for n, p in self.bert_regression_by_chunk.named_parameters() 
-                          if not any(nd in n for nd in no_decay)],
-                "weight_decay": weight_decay,
-                "lr": lr
-            },
-            {
-                "params": [p for n, p in self.bert_regression_by_chunk.named_parameters() 
-                          if any(nd in n for nd in no_decay)],
-                "weight_decay": 0.0,
-                "lr": lr
-            },
-            {
-                "params": self.adaptive_loss.parameters(),
-                "weight_decay": 0.0,
-                "lr": lr * 10  # 손실 가중치는 더 빠르게 학습
-            }
-        ]
-        
-        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=lr, eps=1e-8)
-        
-        # 교차 검증
-        kf = KFold(n_splits=5, shuffle=True, random_state=42)
+        # 교차 검증 대신 단순 train/validation split 사용 (속도 향상)
         loss_list = []
         mse_list = []
         mae_list = []
@@ -317,222 +322,231 @@ class DocumentBertScoringModel():
             with open(log_file, 'a', encoding='utf-8') as f:
                 f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
         
-        for fold, (train_index, test_index) in enumerate(kf.split(data_[0])):
-            log_message(f"=== Fold {fold + 1}/5 시작 ===")
-            fold_start_time = time.time()
-            
-            train_essays = data_[0].iloc[train_index]
-            train_labels = data_[1].iloc[train_index]
-            
-            test_essays = data_[0].iloc[test_index]
-            test_labels = data_[1].iloc[test_index]
-            
-            data = train_essays.tolist(), train_labels.values
-            test_data = test_essays.tolist(), test_labels.values
-            
-            log_message(f"훈련 데이터: {len(train_essays)}개, 검증 데이터: {len(test_essays)}개")
-            
-            # 데이터 인코딩
-            log_message("데이터 인코딩 시작...")
-            encoding_start_time = time.time()
-            
-            document_representations_sentence, _ = encode_documents_by_sentence(
-                data[0], self.bert_tokenizer, max_input_length=self.max_sentence_length)
-            document_representations_full, _ = encode_documents_full_text(
-                data[0], self.bert_tokenizer, max_input_length=self.max_doc_length)
-            
-            correct_output = torch.FloatTensor(data[1])
-            
-            encoding_time = time.time() - encoding_start_time
-            log_message(f"데이터 인코딩 완료 (소요시간: {encoding_time:.2f}초)")
-            
-            # 모델을 디바이스로 이동
-            self.bert_regression_by_word_document.to(device=self.args['device'])
-            self.bert_regression_by_chunk.to(device=self.args['device'])
-            self.adaptive_loss.to(device=self.args['device'])
-            
-            self.bert_regression_by_word_document.train()
-            self.bert_regression_by_chunk.train()
-            self.adaptive_loss.train()
-            
-            # 학습률 스케줄러 설정
-            total_steps = (len(data[0]) // (self.args['batch_size'] * self.args['gradient_accumulation_steps'])) * epochs
-            warmup_steps = int(total_steps * warmup_steps_ratio)
-            
-            from transformers import get_linear_schedule_with_warmup
-            scheduler = get_linear_schedule_with_warmup(
-                optimizer, 
-                num_warmup_steps=warmup_steps,
-                num_training_steps=total_steps
-            )
-            
-            # Fold별 early stopping 초기화
-            fold_best_qwk = -np.inf
-            fold_best_eval_loss = np.inf
-            fold_patience_counter = 0
-            fold_early_stop = False
-            
-            # 학습 루프
-            for epoch in range(1, epochs + 1):
-                if fold_early_stop:
-                    log_message(f"Early stopping triggered at epoch {epoch-1}")
-                    break
-                    
-                epoch_start_time = time.time()
-                epoch_loss = 0
-                num_batches = 0
+        # 데이터 준비
+        train_essays = data_[0].tolist()
+        train_labels = data_[1].values
+        
+        if test:
+            test_essays = test[0].tolist()
+            test_labels = test[1].values
+            test_data_tuple = (test_essays, test_labels)
+        
+        log_message(f"훈련 데이터: {len(train_essays)}개")
+        
+        # 데이터 인코딩
+        log_message("데이터 인코딩 시작...")
+        encoding_start_time = time.time()
+        
+        document_representations_sentence, _ = encode_documents_by_sentence(
+            train_essays, self.bert_tokenizer, max_input_length=self.max_sentence_length)
+        document_representations_full, _ = encode_documents_full_text(
+            train_essays, self.bert_tokenizer, max_input_length=self.max_doc_length)
+        
+        correct_output = torch.FloatTensor(train_labels)
+        
+        encoding_time = time.time() - encoding_start_time
+        log_message(f"데이터 인코딩 완료 (소요시간: {encoding_time:.2f}초)")
+        
+        # 모델을 디바이스로 이동
+        self.bert_regression_by_word_document.to(device=self.args['device'])
+        self.bert_regression_by_chunk.to(device=self.args['device'])
+        self.adaptive_loss.to(device=self.args['device'])
+        
+        self.bert_regression_by_word_document.train()
+        self.bert_regression_by_chunk.train()
+        self.adaptive_loss.train()
+        
+        # 학습률 스케줄러 설정
+        total_steps = (len(train_essays) // (self.args['batch_size'] * self.args['gradient_accumulation_steps'])) * epochs
+        warmup_steps = int(total_steps * warmup_steps_ratio)
+        
+        from transformers import get_linear_schedule_with_warmup
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer, 
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps
+        )
+        
+        # Early stopping 초기화
+        best_qwk = -np.inf
+        patience_counter = 0
+        early_stop = False
+        
+        # 학습 루프
+        for epoch in range(1, epochs + 1):
+            if early_stop:
+                log_message(f"Early stopping triggered at epoch {epoch-1}")
+                break
                 
-                log_message(f"--- Epoch {epoch}/{epochs} 시작 ---")
+            epoch_start_time = time.time()
+            epoch_loss = 0
+            num_batches = 0
+            
+            log_message(f"--- Epoch {epoch}/{epochs} 시작 ---")
+            
+            # 그래디언트 누적을 위한 초기화
+            optimizer.zero_grad()
+            accumulated_loss = 0
+            
+            for i in range(0, document_representations_sentence.shape[0], self.args['batch_size']):
+                batch_start_time = time.time()
                 
-                # 그래디언트 누적을 위한 초기화
-                optimizer.zero_grad()
-                accumulated_loss = 0
+                # 배치 데이터 준비
+                batch_sentence = document_representations_sentence[i:i + self.args['batch_size']].to(
+                    device=self.args['device'])
+                batch_full = document_representations_full[i:i + self.args['batch_size']].to(
+                    device=self.args['device'])
+                batch_labels = correct_output[i:i + self.args['batch_size']].to(
+                    device=self.args['device'])
                 
-                for i in range(0, document_representations_sentence.shape[0], self.args['batch_size']):
-                    batch_start_time = time.time()
+                # Forward pass
+                predictions_sentence = self.bert_regression_by_chunk(batch_sentence, device=self.args['device'])
+                predictions_full = self.bert_regression_by_word_document(batch_full, device=self.args['device'])
+                
+                # 앙상블 예측
+                combined_predictions = 0.6 * predictions_sentence + 0.4 * predictions_full
+                
+                # 손실 계산 (수정된 버전 - 타입 안전성 보장)
+                try:
+                    # 주 손실: 균형 잡힌 MSE
+                    balanced_mse = balanced_multi_criterion_loss(combined_predictions, batch_labels)
                     
-                    # 배치 데이터 준비
-                    batch_sentence = document_representations_sentence[i:i + self.args['batch_size']].to(
-                        device=self.args['device'])
-                    batch_full = document_representations_full[i:i + self.args['batch_size']].to(
-                        device=self.args['device'])
-                    batch_labels = correct_output[i:i + self.args['batch_size']].to(
-                        device=self.args['device'])
-                    
-                    # Forward pass
-                    predictions_sentence = self.bert_regression_by_chunk(batch_sentence, device=self.args['device'])
-                    predictions_full = self.bert_regression_by_word_document(batch_full, device=self.args['device'])
-                    
-                    # 앙상블 예측
-                    combined_predictions = 0.6 * predictions_sentence + 0.4 * predictions_full
-                    
-                    # 개선된 손실 계산
-                    focal_mse = focal_mse_loss(combined_predictions, batch_labels)
+                    # 보조 손실들 - 타입 체크 및 변환
                     sim_loss_val = improved_sim_loss(combined_predictions, batch_labels)
                     mr_loss_val = improved_mr_loss_func(combined_predictions, batch_labels)
                     
-                    losses = torch.stack([focal_mse, sim_loss_val, mr_loss_val])
+                    # 모든 손실이 텐서인지 확인
+                    if not isinstance(balanced_mse, torch.Tensor):
+                        balanced_mse = torch.tensor(balanced_mse, device=self.args['device'], dtype=combined_predictions.dtype)
+                    if not isinstance(sim_loss_val, torch.Tensor):
+                        sim_loss_val = torch.tensor(sim_loss_val, device=self.args['device'], dtype=combined_predictions.dtype)
+                    if not isinstance(mr_loss_val, torch.Tensor):
+                        mr_loss_val = torch.tensor(mr_loss_val, device=self.args['device'], dtype=combined_predictions.dtype)
+                    
+                    # 동적 손실 가중치 적용
+                    losses = torch.stack([balanced_mse, sim_loss_val, mr_loss_val])
                     total_loss, current_weights = self.adaptive_loss(losses)
                     
-                    # 그래디언트 누적을 위해 정규화
-                    total_loss = total_loss / self.args['gradient_accumulation_steps']
-                    total_loss.backward()
-                    
-                    accumulated_loss += total_loss.item()
-                    
-                    # 그래디언트 누적 스텝마다 업데이트
-                    if (num_batches + 1) % self.args['gradient_accumulation_steps'] == 0:
-                        # 그래디언트 클리핑
-                        torch.nn.utils.clip_grad_norm_(
-                            list(self.bert_regression_by_word_document.parameters()) +
-                            list(self.bert_regression_by_chunk.parameters()) +
-                            list(self.adaptive_loss.parameters()),
-                            max_norm=self.args['max_grad_norm']
-                        )
-                        
-                        optimizer.step()
-                        scheduler.step()
-                        optimizer.zero_grad()
-                        
-                        epoch_loss += accumulated_loss
-                        accumulated_loss = 0
-                    
-                    num_batches += 1
-                    batch_time = time.time() - batch_start_time
-                    
-                    # 배치별 상세 로깅 (매 20 배치마다)
-                    if num_batches % 20 == 0:
-                        current_lr = scheduler.get_last_lr()[0]
-                        log_message(f"  Batch {num_batches}: Loss={total_loss.item()*self.args['gradient_accumulation_steps']:.4f} "
-                                f"(Focal_MSE={focal_mse.item():.4f}, Sim={sim_loss_val.item():.4f}, "
-                                f"MR={mr_loss_val.item():.4f}) "
-                                f"Weights=[{current_weights[0]:.3f}, {current_weights[1]:.3f}, {current_weights[2]:.3f}] "
-                                f"LR={current_lr:.2e} Time={batch_time:.2f}s")
+                except Exception as e:
+                    log_message(f"손실 계산 오류: {e}, 기본 MSE 사용")
+                    total_loss = F.mse_loss(combined_predictions, batch_labels)
+                    current_weights = torch.tensor([1.0, 0.0, 0.0])
+                    balanced_mse = total_loss
+                    sim_loss_val = torch.tensor(0.0)
+                    mr_loss_val = torch.tensor(0.0)
                 
-                # 마지막 배치 처리
-                if accumulated_loss > 0:
+                # 그래디언트 누적을 위해 정규화
+                total_loss = total_loss / self.args['gradient_accumulation_steps']
+                total_loss.backward()
+                
+                accumulated_loss += total_loss.item()
+                
+                # 그래디언트 누적 스텝마다 업데이트
+                if (num_batches + 1) % self.args['gradient_accumulation_steps'] == 0:
+                    # 그래디언트 클리핑
                     torch.nn.utils.clip_grad_norm_(
                         list(self.bert_regression_by_word_document.parameters()) +
                         list(self.bert_regression_by_chunk.parameters()) +
                         list(self.adaptive_loss.parameters()),
                         max_norm=self.args['max_grad_norm']
                     )
+                    
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
+                    
                     epoch_loss += accumulated_loss
+                    accumulated_loss = 0
                 
-                effective_batches = max(1, num_batches // self.args['gradient_accumulation_steps'])
-                epoch_loss /= effective_batches
-                loss_list.append(epoch_loss)
-                epoch_time = time.time() - epoch_start_time
+                num_batches += 1
+                batch_time = time.time() - batch_start_time
                 
-                current_lr = scheduler.get_last_lr()[0]
-                log_message(f'Fold {fold + 1}, Epoch {epoch} 완료 - '
-                        f'Loss: {epoch_loss:.4f}, '
-                        f'LR: {current_lr:.2e}, '
-                        f'Time: {epoch_time:.2f}s')
-                
-                # 검증
-                if test:
-                    eval_start_time = time.time()
-                    log_message("검증 시작...")
-                    
-                    overall_mse, overall_mae, _, overall_qwk, eval_loss, criterion_mse, criterion_mae, criterion_qwk = self.predict_for_regress(test_data)
-                    mse_list.append(overall_mse)
-                    mae_list.append(overall_mae)
-                    
-                    eval_time = time.time() - eval_start_time
-                    
-                    log_message(f"검증 완료 (소요시간: {eval_time:.2f}초)")
-                    log_message(f"Overall - MSE: {overall_mse:.4f}, MAE: {overall_mae:.4f}, "
-                            f"QWK: {overall_qwk:.4f}, Eval Loss: {eval_loss:.4f}")
-                    
-                    # 각 평가 기준별 결과 로깅 (간소화)
-                    avg_criterion_qwk = np.mean(criterion_qwk)
-                    log_message(f"평균 기준별 QWK: {avg_criterion_qwk:.4f}")
-                    
-                    # 개선된 모델 저장 로직
-                    save_flag = False
-                    improvement_msg = ""
-                    
-                    # QWK 기준으로만 판단 (단순화)
-                    if overall_qwk > fold_best_qwk:
-                        fold_best_qwk = overall_qwk
-                        save_flag = True
-                        improvement_msg = f"QWK 개선 ({overall_qwk:.4f})"
-                        fold_patience_counter = 0
-                    elif eval_loss < fold_best_eval_loss:
-                        fold_best_eval_loss = eval_loss
-                        save_flag = True
-                        improvement_msg = f"Eval Loss 개선 ({eval_loss:.4f})"
-                        fold_patience_counter = 0                        
-                    else:
-                        fold_patience_counter += 1
-                        improvement_msg = f"성능 개선 없음 (patience: {fold_patience_counter}/{patience})"
-                    
-                    if save_flag:
-                        if not os.path.exists(model_save_dir):
-                            os.makedirs(model_save_dir)
-                        self.bert_regression_by_word_document.save_pretrained(doc_model_save_dir)
-                        self.bert_regression_by_chunk.save_pretrained(chunk_model_save_dir)
-                        torch.save(self.adaptive_loss.state_dict(), os.path.join(model_save_dir, 'adaptive_loss.pt'))
-                        log_message(f"모델 저장 완료: {improvement_msg}")
-                    else:
-                        log_message(improvement_msg)
-                    
-                    # Early stopping 체크
-                    if fold_patience_counter >= patience:
-                        log_message(f"Early stopping: {patience} epochs 동안 성능 개선 없음")
-                        fold_early_stop = True
-                    
-                    # 다시 학습 모드로 변경
-                    self.bert_regression_by_word_document.train()
-                    self.bert_regression_by_chunk.train()
-                    self.adaptive_loss.train()
+                # 배치별 상세 로깅 (매 20 배치마다)
+                if num_batches % 20 == 0:
+                    current_lr = scheduler.get_last_lr()[0]
+                    log_message(f"  Batch {num_batches}: Loss={total_loss.item()*self.args['gradient_accumulation_steps']:.4f} "
+                            f"(Balanced_MSE={balanced_mse.item():.4f}, Sim={sim_loss_val.item():.4f}, "
+                            f"MR={mr_loss_val.item():.4f}) "
+                            f"Weights=[{current_weights[0]:.3f}, {current_weights[1]:.3f}, {current_weights[2]:.3f}] "
+                            f"LR={current_lr:.2e} Time={batch_time:.2f}s")
             
-            fold_time = time.time() - fold_start_time
-            log_message(f"=== Fold {fold + 1} 완료 (총 소요시간: {fold_time:.2f}초) ===\n")
+            # 마지막 배치 처리
+            if accumulated_loss > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    list(self.bert_regression_by_word_document.parameters()) +
+                    list(self.bert_regression_by_chunk.parameters()) +
+                    list(self.adaptive_loss.parameters()),
+                    max_norm=self.args['max_grad_norm']
+                )
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                epoch_loss += accumulated_loss
+            
+            effective_batches = max(1, num_batches // self.args['gradient_accumulation_steps'])
+            epoch_loss /= effective_batches
+            loss_list.append(epoch_loss)
+            epoch_time = time.time() - epoch_start_time
+            
+            current_lr = scheduler.get_last_lr()[0]
+            log_message(f'Epoch {epoch} 완료 - '
+                    f'Loss: {epoch_loss:.4f}, '
+                    f'LR: {current_lr:.2e}, '
+                    f'Time: {epoch_time:.2f}s')
+            
+            # 검증
+            if test:
+                eval_start_time = time.time()
+                log_message("검증 시작...")
+                
+                overall_mse, overall_mae, _, overall_qwk, eval_loss, criterion_mse, criterion_mae, criterion_qwk = self.predict_for_regress(test_data_tuple)
+                mse_list.append(overall_mse)
+                mae_list.append(overall_mae)
+                
+                eval_time = time.time() - eval_start_time
+                
+                log_message(f"검증 완료 (소요시간: {eval_time:.2f}초)")
+                log_message(f"Overall - MSE: {overall_mse:.4f}, MAE: {overall_mae:.4f}, "
+                        f"QWK: {overall_qwk:.4f}, Eval Loss: {eval_loss:.4f}")
+                
+                # 어려운 기준들의 성능 출력
+                difficult_indices = [2, 4, 9]  # 문장 표현, 문단 간 구조, 프롬프트 독해력
+                difficult_qwk = np.mean([criterion_qwk[i] for i in difficult_indices])
+                log_message(f"어려운 기준 평균 QWK: {difficult_qwk:.4f}")
+                
+                # 모델 저장 로직
+                save_flag = False
+                improvement_msg = ""
+                
+                # QWK 기준으로 판단
+                if overall_qwk > best_qwk:
+                    best_qwk = overall_qwk
+                    save_flag = True
+                    improvement_msg = f"QWK 개선 ({overall_qwk:.4f})"
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    improvement_msg = f"성능 개선 없음 (patience: {patience_counter}/{patience})"
+                
+                if save_flag:
+                    if not os.path.exists(model_save_dir):
+                        os.makedirs(model_save_dir)
+                    self.bert_regression_by_word_document.save_pretrained(doc_model_save_dir)
+                    self.bert_regression_by_chunk.save_pretrained(chunk_model_save_dir)
+                    torch.save(self.adaptive_loss.state_dict(), os.path.join(model_save_dir, 'adaptive_loss.pt'))
+                    log_message(f"모델 저장 완료: {improvement_msg}")
+                else:
+                    log_message(improvement_msg)
+                
+                # Early stopping 체크
+                if patience_counter >= patience:
+                    log_message(f"Early stopping: {patience} epochs 동안 성능 개선 없음")
+                    early_stop = True
+                
+                # 다시 학습 모드로 변경
+                self.bert_regression_by_word_document.train()
+                self.bert_regression_by_chunk.train()
+                self.adaptive_loss.train()
         
         # 전체 학습 완료 후 결과 저장
         os.makedirs('./train_valid_loss', exist_ok=True)
@@ -544,14 +558,16 @@ class DocumentBertScoringModel():
         final_mae = np.mean(mae_list) if mae_list else float('inf')
         
         log_message("="*80)
-        log_message("개선된 학습 완료!")
+        log_message("수정된 학습 완료!")
         log_message(f"최종 평균 MSE: {final_mse:.4f}")
         log_message(f"최종 평균 MAE: {final_mae:.4f}")
+        log_message(f"최고 QWK: {best_qwk:.4f}")
         log_message(f"로그 파일 저장 위치: {log_file}")
         log_message(f"종료 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
         print(f"Average MSE: {final_mse:.4f}")
         print(f"Average MAE: {final_mae:.4f}")
+        print(f"Best QWK: {best_qwk:.4f}")
         print(f"Training log saved to: {log_file}")
 
     def predict_single(self, input_sentence):
@@ -657,3 +673,49 @@ class DocumentBertScoringModel():
             print("matplotlib이 설치되지 않아 시각화를 건너뜁니다.")
         except Exception as e:
             print(f"시각화 중 오류 발생: {e}")
+
+    def analyze_data_imbalance(self, train_labels):
+        """데이터 불균형 분석"""
+        train_array = np.array(train_labels)
+        
+        print("\n" + "="*60)
+        print("📊 데이터 불균형 분석 및 대응 전략")
+        print("="*60)
+        
+        # 기준별 분석
+        easy_criteria = []
+        medium_criteria = []
+        hard_criteria = []
+        
+        for i, name in enumerate(self.criterion_names):
+            mean_score = np.mean(train_array[:, i])
+            std_score = np.std(train_array[:, i])
+            
+            # 난이도 분류
+            if mean_score >= 2.5 and std_score <= 0.5:
+                easy_criteria.append((i, name, mean_score, std_score))
+            elif mean_score <= 1.5 or std_score >= 1.2:
+                hard_criteria.append((i, name, mean_score, std_score))
+            else:
+                medium_criteria.append((i, name, mean_score, std_score))
+        
+        print(f"🟢 쉬운 기준 ({len(easy_criteria)}개):")
+        for idx, name, mean, std in easy_criteria:
+            print(f"   {name}: 평균={mean:.3f}, 표준편차={std:.3f}")
+        
+        print(f"\n🟡 보통 기준 ({len(medium_criteria)}개):")
+        for idx, name, mean, std in medium_criteria:
+            print(f"   {name}: 평균={mean:.3f}, 표준편차={std:.3f}")
+        
+        print(f"\n🔴 어려운 기준 ({len(hard_criteria)}개):")
+        for idx, name, mean, std in hard_criteria:
+            print(f"   {name}: 평균={mean:.3f}, 표준편차={std:.3f}")
+        
+        # 대응 전략 출력
+        print(f"\n🎯 적용된 대응 전략:")
+        print("1. 균형 잡힌 손실 함수: 어려운 기준에 1.5배 가중치")
+        print("2. 동적 손실 가중치: 학습 중 자동 조정")
+        print("3. 앙상블 모델: 문장별 + 전체 문서 처리")
+        print("4. 그래디언트 클리핑: 안정적인 학습")
+        
+        return easy_criteria, medium_criteria, hard_criteria
